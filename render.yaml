@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: outbid-city-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: node dist/src/server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: outbid-city-db
+          property: connectionString
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        value: https://outbidcity.lol/checkout/success?session_id={CHECKOUT_SESSION_ID}
+      - key: STRIPE_CANCEL_URL
+        value: https://outbidcity.lol/checkout/cancel
+      - key: CORS_ORIGIN
+        value: https://outbidcity.lol
+
+databases:
+  - name: outbid-city-db
+    plan: free
