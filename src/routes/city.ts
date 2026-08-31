@@ -9,6 +9,27 @@ const clickRateMap = new Map<string, number>()
 const IMP_WINDOW_MS = 30 * 60 * 1000
 const CLICK_WINDOW_MS = 10 * 60 * 1000
 
+// Hard caps so a hostile client can't (a) blow up the in-memory maps with unbounded unique
+// keys, or (b) send pathologically large ids. slotId/visitorId are short by design.
+const MAX_ID_LEN = 128
+const MAX_RATE_MAP_ENTRIES = 50_000
+
+function validId(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= MAX_ID_LEN
+}
+
+// Evict oldest entries if a map grows past the cap (crude but bounded; these maps are a
+// best-effort dedupe, not a source of truth).
+function capMap(m: Map<string, number>) {
+  if (m.size <= MAX_RATE_MAP_ENTRIES) return
+  const drop = m.size - MAX_RATE_MAP_ENTRIES
+  let i = 0
+  for (const k of m.keys()) {
+    m.delete(k)
+    if (++i >= drop) break
+  }
+}
+
 export async function cityRoutes(app: FastifyInstance) {
   // Static layout — cacheable, only changes when city_version bumps.
   app.get("/api/v1/city", async (_req, reply) => {
@@ -48,6 +69,22 @@ export async function cityRoutes(app: FastifyInstance) {
     return { buildings: rows }
   })
 
+  // Live graveyard snapshot — every plot (claimed or not) with its default/owner label,
+  // story and bid. Uncached and real-time like /api/v1/building-owners: ownership changes
+  // via Stripe. The default dead-startup label lives on the plot row (seeded), so this one
+  // query serves both the classic tombstones and any user-buried startup uniformly.
+  app.get("/api/v1/graveyard", async () => {
+    const { rows } = await pool.query(
+      `select g.plot_id, g.company_id, g.name, g.story, g.domain, g.born, g.died,
+              g.standing_bid_cents, g.paid_total_cents, g.claimed_at, g.last_raise_at,
+              c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
+       from graveyard_plots g
+       left join companies c on c.company_id = g.company_id
+       order by g.plot_id`,
+    )
+    return { plots: rows }
+  })
+
   app.get<{ Params: { slotId: string } }>("/api/v1/holdings/:slotId", async (req, reply) => {
     const { rows } = await pool.query(
       `select h.*, c.name as company_name, c.url as company_url from holdings h
@@ -76,12 +113,13 @@ export async function cityRoutes(app: FastifyInstance) {
   // Rate-limited: once per visitorId+slotId per 30 min (in-memory, ephemeral across restarts).
   app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/impression", async (req, reply) => {
     const { slotId, visitorId } = req.body ?? {}
-    if (!slotId || !visitorId) return reply.code(400).send({ error: "missing_fields" })
+    if (!validId(slotId) || !validId(visitorId)) return reply.code(400).send({ error: "missing_fields" })
     const key = `${visitorId}:${slotId}`
     const now = Date.now()
     const last = impRateMap.get(key) ?? 0
     if (now - last < IMP_WINDOW_MS) return { ok: false, reason: "rate_limited" }
     impRateMap.set(key, now)
+    capMap(impRateMap)
     const { rows } = await pool.query(
       `update holdings set impressions = impressions + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
       [slotId],
@@ -104,12 +142,13 @@ export async function cityRoutes(app: FastifyInstance) {
   // Rate-limited: once per visitorId+slotId per 10 min (in-memory, ephemeral across restarts).
   app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/click", async (req, reply) => {
     const { slotId, visitorId } = req.body ?? {}
-    if (!slotId || !visitorId) return reply.code(400).send({ error: "missing_fields" })
+    if (!validId(slotId) || !validId(visitorId)) return reply.code(400).send({ error: "missing_fields" })
     const key = `${visitorId}:${slotId}`
     const now = Date.now()
     const last = clickRateMap.get(key) ?? 0
     if (now - last < CLICK_WINDOW_MS) return { ok: false, reason: "rate_limited" }
     clickRateMap.set(key, now)
+    capMap(clickRateMap)
     const { rows } = await pool.query(
       `update holdings set clicks = clicks + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
       [slotId],

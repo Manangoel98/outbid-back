@@ -23,6 +23,19 @@ export type BuildingDelta = {
   company: { name: string; url: string; tagline: string; logoUrl: string | null; primary: string; ink: string } | null
 }
 
+export type GraveyardDelta = {
+  type: "graveyard"
+  plotId: string
+  companyId: string | null
+  name: string
+  story: string
+  domain: string | null
+  born: number | null
+  died: number | null
+  standingBidCents: number
+  company: { name: string; url: string; tagline: string; logoUrl: string | null; primary: string; ink: string } | null
+}
+
 export type PlayerDelta = {
   type: "player"
   playerId: string
@@ -42,7 +55,7 @@ export type OnlineCount = {
   totalVisits: number
 }
 
-export type CityEvent = HoldingDelta | BuildingDelta | PlayerDelta | PlayerLeft | OnlineCount
+export type CityEvent = HoldingDelta | BuildingDelta | GraveyardDelta | PlayerDelta | PlayerLeft | OnlineCount
 
 type Listener = (event: CityEvent) => void
 

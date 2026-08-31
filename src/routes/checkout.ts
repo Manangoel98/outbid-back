@@ -28,6 +28,17 @@ const buildingCheckoutBody = z.object({
   companyDraft,
 })
 
+const graveyardCheckoutBody = z.object({
+  plotId: z.string().min(1).max(64),
+  amountCents: z.number().int().min(env.floorCents).max(env.maxBidCents),
+  startupName: z.string().min(1).max(60),
+  story: z.string().max(600).default(""),
+  domain: z.string().max(120).nullish(),
+  born: z.number().int().min(1900).max(2100).nullish(),
+  died: z.number().int().min(1900).max(2100).nullish(),
+  companyDraft,
+})
+
 export async function checkoutRoutes(app: FastifyInstance) {
   // Tighter than the global default (see server.ts) — checkout creates real Stripe
   // sessions, so it's the most expensive/abusable route in the API.
@@ -111,6 +122,63 @@ export async function checkoutRoutes(app: FastifyInstance) {
         officeName: body.officeName,
         companyDraft: JSON.stringify(body.companyDraft),
         amountCents: String(amountCents),
+      },
+      success_url: env.stripeSuccessUrl,
+      cancel_url: env.stripeCancelUrl,
+    })
+
+    await pool.query(`update orders set stripe_checkout_session_id = $1 where order_id = $2`, [session.id, orderId])
+    return { url: session.url }
+  })
+
+  // Bury/outbid a graveyard plot. Minimum is the current standing bid + takeDelta (or the
+  // $1 floor for an empty plot), recomputed from graveyard_plots here — never trusted from
+  // the client. name/story are moderated like any other buyer-visible free text.
+  app.post("/api/v1/checkout/graveyard", { config: { rateLimit: checkoutRateLimit } }, async (req, reply) => {
+    const body = graveyardCheckoutBody.parse(req.body)
+    const mod = moderateCompanyDraft(body.companyDraft)
+    if (!mod.ok) return reply.code(400).send({ error: mod.reason })
+    const nameMod = moderateFreeText(body.startupName)
+    if (!nameMod.ok) return reply.code(400).send({ error: nameMod.reason })
+    if (body.story) {
+      const storyMod = moderateFreeText(body.story)
+      if (!storyMod.ok) return reply.code(400).send({ error: storyMod.reason })
+    }
+    const { rows } = await pool.query<{ standing_bid_cents: number }>(
+      `select standing_bid_cents from graveyard_plots where plot_id = $1`,
+      [body.plotId],
+    )
+    if (!rows[0]) return reply.code(404).send({ error: "unknown_plot" })
+    const need = computeTakePriceCents(rows[0].standing_bid_cents, false)
+    if (body.amountCents < need) return reply.code(409).send({ error: "bid_too_low", minNeeded: need })
+
+    const { rows: orderRows } = await pool.query(
+      `insert into orders (kind, graveyard_plot_id, quantity, price_per_unit_cents, total_cents, status)
+       values ('graveyard', $1, 1, $2, $2, 'pending') returning order_id`,
+      [body.plotId, body.amountCents],
+    )
+    const orderId = orderRows[0]!.order_id as string
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: { currency: "usd", product_data: { name: `Bury ${body.startupName} in Outbid City graveyard` }, unit_amount: body.amountCents },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        orderId,
+        kind: "graveyard",
+        plotId: body.plotId,
+        startupName: body.startupName,
+        story: body.story ?? "",
+        domain: body.domain ?? "",
+        born: body.born != null ? String(body.born) : "",
+        died: body.died != null ? String(body.died) : "",
+        companyDraft: JSON.stringify(body.companyDraft),
+        amountCents: String(body.amountCents),
       },
       success_url: env.stripeSuccessUrl,
       cancel_url: env.stripeCancelUrl,

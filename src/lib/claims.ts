@@ -175,3 +175,78 @@ export async function claimBuilding(opts: {
     return row
   })
 }
+
+/**
+ * Bury/outbid a graveyard plot, run *after* Stripe confirms payment. Same optimistic-lock
+ * shape as claimBuilding: the UPDATE only wins if the new bid strictly exceeds the current
+ * standing bid, so a concurrent higher outbid can't be clobbered. Writes the buyer-supplied
+ * startup name/story/domain/years onto the plot (already moderated in routes/checkout.ts).
+ */
+export async function claimGraveyard(opts: {
+  plotId: string
+  amountCents: number
+  startupName: string
+  story: string
+  domain: string | null
+  born: number | null
+  died: number | null
+  draft: CompanyDraft
+  ownerUserId: string | null
+  orderId: string
+  stripePaymentIntentId?: string | null
+}) {
+  return withTx(async (client) => {
+    const companyId = await upsertCompany(client, opts.draft, opts.ownerUserId)
+
+    const { rows } = await client.query<{
+      plot_id: string
+      company_id: string | null
+      standing_bid_cents: number
+    }>(
+      `update graveyard_plots
+       set company_id = $1,
+           name = $2,
+           story = $3,
+           domain = $4,
+           born = $5,
+           died = $6,
+           standing_bid_cents = $7,
+           paid_total_cents = paid_total_cents + $7,
+           claimed_at = coalesce(claimed_at, now()),
+           last_raise_at = now(),
+           version = version + 1
+       where plot_id = $8 and standing_bid_cents < $7
+       returning plot_id, company_id, standing_bid_cents`,
+      [companyId, opts.startupName, opts.story, opts.domain, opts.born, opts.died, opts.amountCents, opts.plotId],
+    )
+
+    if (rows.length === 0) {
+      const { rows: cur } = await client.query<{ standing_bid_cents: number }>(
+        `select standing_bid_cents from graveyard_plots where plot_id = $1`,
+        [opts.plotId],
+      )
+      throw new ClaimConflictError(cur[0]?.standing_bid_cents ?? 0)
+    }
+
+    await client.query(
+      `update orders set status = 'succeeded', stripe_payment_intent_id = coalesce($2, stripe_payment_intent_id)
+       where order_id = $1 and status in ('pending', 'processing')`,
+      [opts.orderId, opts.stripePaymentIntentId ?? null],
+    )
+
+    const row = rows[0]!
+    publish({
+      type: "graveyard",
+      plotId: row.plot_id,
+      companyId: row.company_id,
+      name: opts.startupName,
+      story: opts.story,
+      domain: opts.domain,
+      born: opts.born,
+      died: opts.died,
+      standingBidCents: row.standing_bid_cents,
+      company: companySnapshot(opts.draft),
+    })
+    return row
+  })
+}

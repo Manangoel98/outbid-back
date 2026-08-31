@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify"
 import { env } from "../env.js"
 import { pool } from "../lib/db.js"
 import { stripe } from "../lib/stripe.js"
-import { ClaimConflictError, claimBuilding, claimSlot, type CompanyDraft } from "../lib/claims.js"
+import { ClaimConflictError, claimBuilding, claimGraveyard, claimSlot, type CompanyDraft } from "../lib/claims.js"
 
 /**
  * Stripe webhook — the only place holdings actually flip. Idempotent on
@@ -85,8 +85,22 @@ export async function webhookRoutes(app: FastifyInstance) {
             orderId,
             stripePaymentIntentId: paymentIntentId,
           })
+        } else if (meta.kind === "graveyard") {
+          const draft: CompanyDraft = JSON.parse(meta.companyDraft ?? "{}")
+          await claimGraveyard({
+            plotId: meta.plotId!,
+            amountCents: Number(meta.amountCents),
+            startupName: meta.startupName ?? "",
+            story: meta.story ?? "",
+            domain: meta.domain ? meta.domain : null,
+            born: meta.born ? Number(meta.born) : null,
+            died: meta.died ? Number(meta.died) : null,
+            draft,
+            ownerUserId: null,
+            orderId,
+            stripePaymentIntentId: paymentIntentId,
+          })
         } else {
-          await pool.query(`update orders set status = 'failed' where order_id = $1 and status = 'processing'`, [orderId])
         }
       } catch (err) {
         if (err instanceof ClaimConflictError && paymentIntentId) {

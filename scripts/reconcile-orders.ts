@@ -11,7 +11,7 @@
 import "dotenv/config"
 import { pool } from "../src/lib/db.js"
 import { stripe } from "../src/lib/stripe.js"
-import { ClaimConflictError, claimBuilding, claimSlot, type CompanyDraft } from "../src/lib/claims.js"
+import { ClaimConflictError, claimBuilding, claimGraveyard, claimSlot, type CompanyDraft } from "../src/lib/claims.js"
 
 async function main() {
   const { rows: pending } = await pool.query<{
@@ -19,10 +19,11 @@ async function main() {
     kind: string
     slot_ids: string[]
     building_id: number | null
+    graveyard_plot_id: string | null
     total_cents: number
     stripe_checkout_session_id: string | null
   }>(
-    `select order_id, kind, slot_ids, building_id, total_cents, stripe_checkout_session_id
+    `select order_id, kind, slot_ids, building_id, graveyard_plot_id, total_cents, stripe_checkout_session_id
      from orders where status = 'pending' and stripe_checkout_session_id is not null
      order by created_at asc`,
   )
@@ -92,6 +93,22 @@ async function main() {
           stripePaymentIntentId: paymentIntentId,
         })
         console.log(`  [${order.order_id}] RECOVERED building claim: building=${row.building_id} company=${row.office_owner_id}`)
+      } else if (meta.kind === "graveyard" || order.kind === "graveyard") {
+        const draft: CompanyDraft = JSON.parse(meta.companyDraft ?? "{}")
+        const row = await claimGraveyard({
+          plotId: meta.plotId ?? order.graveyard_plot_id!,
+          amountCents: Number(meta.amountCents ?? order.total_cents),
+          startupName: meta.startupName ?? "",
+          story: meta.story ?? "",
+          domain: meta.domain ? meta.domain : null,
+          born: meta.born ? Number(meta.born) : null,
+          died: meta.died ? Number(meta.died) : null,
+          draft,
+          ownerUserId: null,
+          orderId: order.order_id,
+          stripePaymentIntentId: paymentIntentId,
+        })
+        console.log(`  [${order.order_id}] RECOVERED graveyard claim: plot=${row.plot_id} company=${row.company_id}`)
       } else {
         console.log(`  [${order.order_id}] unknown kind "${meta.kind}" — skipping`)
         await pool.query(`update orders set status = 'failed' where order_id = $1 and status = 'processing'`, [order.order_id])

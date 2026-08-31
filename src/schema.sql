@@ -45,6 +45,30 @@ alter table buildings add column if not exists h real not null default 30;
 alter table buildings add column if not exists building_uid uuid not null default gen_random_uuid();
 create unique index if not exists buildings_building_uid_idx on buildings (building_uid);
 
+-- 1.2b graveyard_plots: "Startup Graveyard" — a third kind of sellable spot, modeled exactly
+-- like holdings (deterministic text plot_id "gy-N" from generateCity(), 0 standing_bid = never
+-- claimed, dormant plot_uid for ownership history across a future city_version renumber).
+-- Fully additive; nothing here touches slots/buildings/holdings/orders rows.
+create table if not exists graveyard_plots (
+  plot_id            text primary key,
+  plot_uid           uuid not null default gen_random_uuid(),
+  company_id         uuid null references companies(company_id) on delete set null,
+  name               text not null default '',
+  story              text not null default '',
+  domain             text null,
+  born               integer null,
+  died               integer null,
+  standing_bid_cents integer not null default 0,
+  paid_total_cents   bigint not null default 0,
+  claimed_at         timestamptz null,
+  last_raise_at      timestamptz null,
+  version            bigint not null default 0,
+  city_version       integer not null default 1,
+  created_at         timestamptz not null default now()
+);
+create unique index if not exists graveyard_plots_plot_uid_idx on graveyard_plots (plot_uid);
+create index if not exists graveyard_plots_company_idx on graveyard_plots (company_id);
+
 -- 1.3 companies: a brand a user controls
 create table if not exists companies (
   company_id         uuid primary key default gen_random_uuid(),
@@ -130,6 +154,12 @@ create index if not exists slots_kind_idx on slots (kind);
 alter table orders drop constraint if exists orders_status_check;
 alter table orders add constraint orders_status_check check (status in ('pending', 'processing', 'succeeded', 'failed', 'refunded'));
 
+-- Graveyard is a third order kind. Widen the kind CHECK idempotently (same drop/add pattern as
+-- status above) and add a nullable plot reference so the webhook knows which grave to claim.
+alter table orders add column if not exists graveyard_plot_id text null;
+alter table orders drop constraint if exists orders_kind_check;
+alter table orders add constraint orders_kind_check check (kind in ('single', 'fleet_bulk', 'building', 'graveyard'));
+
 -- ---------------------------------------------------------------------------
 -- Row Level Security (Supabase linter: rls_disabled_in_public)
 --
@@ -144,6 +174,7 @@ alter table public.companies enable row level security;
 alter table public.buildings enable row level security;
 alter table public.users enable row level security;
 alter table public.orders enable row level security;
+alter table public.graveyard_plots enable row level security;
 
 -- Belt-and-suspenders: strip default API grants (RLS alone is sufficient when no policies exist).
 revoke all on table public.slots from anon, authenticated;
@@ -152,3 +183,4 @@ revoke all on table public.companies from anon, authenticated;
 revoke all on table public.buildings from anon, authenticated;
 revoke all on table public.users from anon, authenticated;
 revoke all on table public.orders from anon, authenticated;
+revoke all on table public.graveyard_plots from anon, authenticated;

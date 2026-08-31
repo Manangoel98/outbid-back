@@ -64,6 +64,17 @@ async function main() {
         [b.id, b.x, b.z, b.w, b.d, b.h, b.district, Math.max(1, Math.round(b.h / 4))],
       )
     }
+
+    // Graveyard plots: a third sellable kind, seeded EMPTY (no baked startup data — the
+    // graveyard shows real user-buried startups only). on conflict does nothing so an
+    // existing purchased grave is never touched; we only ensure the plot row exists.
+    const gvPlots: Array<{ plotId: string }> = city.graveyard?.plots ?? []
+    for (const p of gvPlots) {
+      await pool.query(
+        `insert into graveyard_plots (plot_id) values ($1) on conflict (plot_id) do nothing`,
+        [p.plotId],
+      )
+    }
   }
 
   await pool.query(
@@ -103,6 +114,13 @@ async function main() {
       [currentBuildingIds],
     )
     if (staleBuildings) console.log(`Pruned ${staleBuildings} stale unclaimed building(s) no longer in generateCity().`)
+
+    const currentPlotIds: string[] = (city.graveyard?.plots ?? []).map((p: { plotId: string }) => p.plotId)
+    const { rowCount: stalePlots } = await pool.query(
+      `delete from graveyard_plots where plot_id <> all($1::text[]) and company_id is null`,
+      [currentPlotIds],
+    )
+    if (stalePlots) console.log(`Pruned ${stalePlots} stale unclaimed graveyard plot(s) no longer in generateCity().`)
   }
 
   console.log("Seed complete.")
