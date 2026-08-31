@@ -9,6 +9,7 @@ import { cityRoutes } from "./routes/city.js"
 import { checkoutRoutes } from "./routes/checkout.js"
 import { webhookRoutes } from "./routes/webhook.js"
 import { wsRoutes } from "./routes/ws.js"
+import { statsRoutes } from "./routes/stats.js"
 
 async function main() {
   const app = Fastify({ logger: true, bodyLimit: env.bodyLimitBytes })
@@ -55,6 +56,7 @@ async function main() {
   await app.register(checkoutRoutes)
   await app.register(webhookRoutes)
   await app.register(wsRoutes)
+  await app.register(statsRoutes)
 
   app.get("/healthz", async () => ({ ok: true }))
 

@@ -10,6 +10,8 @@ export type HoldingDelta = {
   standingBidCents: number
   claimedAt: string | null
   company: { name: string; url: string; tagline: string; logoUrl: string | null; primary: string; ink: string } | null
+  impressions?: number
+  clicks?: number
 }
 
 export type BuildingDelta = {
@@ -34,7 +36,13 @@ export type PlayerLeft = {
   playerId: string
 }
 
-export type CityEvent = HoldingDelta | BuildingDelta | PlayerDelta | PlayerLeft
+export type OnlineCount = {
+  type: "online_count"
+  count: number
+  totalVisits: number
+}
+
+export type CityEvent = HoldingDelta | BuildingDelta | PlayerDelta | PlayerLeft | OnlineCount
 
 type Listener = (event: CityEvent) => void
 

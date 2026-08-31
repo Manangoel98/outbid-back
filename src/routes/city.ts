@@ -1,5 +1,13 @@
 import type { FastifyInstance } from "fastify"
 import { pool } from "../lib/db.js"
+import { publish } from "../lib/bus.js"
+
+// In-memory rate limiting: key = "visitorId:slotId", value = timestamp of last accepted event.
+// At most 1 impression per visitorId+slotId per 30 min, 1 click per 10 min.
+const impRateMap = new Map<string, number>()
+const clickRateMap = new Map<string, number>()
+const IMP_WINDOW_MS = 30 * 60 * 1000
+const CLICK_WINDOW_MS = 10 * 60 * 1000
 
 export async function cityRoutes(app: FastifyInstance) {
   // Static layout — cacheable, only changes when city_version bumps.
@@ -62,5 +70,61 @@ export async function cityRoutes(app: FastifyInstance) {
     ])
     if (!rows[0]) return reply.code(404).send({ error: "not_found" })
     return rows[0]
+  })
+
+  // Analytics: record an impression (walk-by) for a slot.
+  // Rate-limited: once per visitorId+slotId per 30 min (in-memory, ephemeral across restarts).
+  app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/impression", async (req, reply) => {
+    const { slotId, visitorId } = req.body ?? {}
+    if (!slotId || !visitorId) return reply.code(400).send({ error: "missing_fields" })
+    const key = `${visitorId}:${slotId}`
+    const now = Date.now()
+    const last = impRateMap.get(key) ?? 0
+    if (now - last < IMP_WINDOW_MS) return { ok: false, reason: "rate_limited" }
+    impRateMap.set(key, now)
+    const { rows } = await pool.query(
+      `update holdings set impressions = impressions + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
+      [slotId],
+    )
+    if (!rows[0]) return reply.code(404).send({ error: "not_found" })
+    publish({
+      type: "holding",
+      slotId: rows[0].slot_id,
+      companyId: null,
+      standingBidCents: -1,
+      claimedAt: null,
+      company: null,
+      impressions: rows[0].impressions,
+      clicks: rows[0].clicks,
+    } as Parameters<typeof publish>[0])
+    return { ok: true }
+  })
+
+  // Analytics: record a click (visit) for a slot.
+  // Rate-limited: once per visitorId+slotId per 10 min (in-memory, ephemeral across restarts).
+  app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/click", async (req, reply) => {
+    const { slotId, visitorId } = req.body ?? {}
+    if (!slotId || !visitorId) return reply.code(400).send({ error: "missing_fields" })
+    const key = `${visitorId}:${slotId}`
+    const now = Date.now()
+    const last = clickRateMap.get(key) ?? 0
+    if (now - last < CLICK_WINDOW_MS) return { ok: false, reason: "rate_limited" }
+    clickRateMap.set(key, now)
+    const { rows } = await pool.query(
+      `update holdings set clicks = clicks + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
+      [slotId],
+    )
+    if (!rows[0]) return reply.code(404).send({ error: "not_found" })
+    publish({
+      type: "holding",
+      slotId: rows[0].slot_id,
+      companyId: null,
+      standingBidCents: -1,
+      claimedAt: null,
+      company: null,
+      impressions: rows[0].impressions,
+      clicks: rows[0].clicks,
+    } as Parameters<typeof publish>[0])
+    return { ok: true }
   })
 }

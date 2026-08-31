@@ -14,6 +14,12 @@ export const pool = new Pool({
   ssl: poolSslOption(),
 })
 
+// Prevent unhandled 'error' events from crashing the process on transient
+// network drops (ECONNRESET from Supabase/hosted Postgres).
+pool.on("error", (err) => {
+  console.error("[pool] idle client error — will reconnect on next query:", err.message)
+})
+
 export async function withTx<T>(fn: (client: import("pg").PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   try {
