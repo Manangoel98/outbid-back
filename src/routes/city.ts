@@ -32,22 +32,26 @@ function capMap(m: Map<string, number>) {
 
 export async function cityRoutes(app: FastifyInstance) {
   // Static layout — cacheable, only changes when city_version bumps.
+  // is_free ships here (not on the live endpoints) because it is immutable layout data:
+  // this is what lets the client mark *unclaimed* free spots, which is the whole point.
   app.get("/api/v1/city", async (_req, reply) => {
     const [slots, buildings] = await Promise.all([
-      pool.query(`select slot_id, kind, tier, floor_cents, district, name, w, h, meta from slots order by slot_id`),
-      pool.query(`select building_id, x, z, w, d, h, district, floors from buildings order by building_id`),
+      pool.query(`select slot_id, kind, tier, floor_cents, district, name, w, h, meta, is_free from slots order by slot_id`),
+      pool.query(`select building_id, x, z, w, d, h, district, floors, is_free from buildings order by building_id`),
     ])
     reply.header("cache-control", "public, max-age=300")
     return { slots: slots.rows, buildings: buildings.rows }
   })
 
   // Live occupancy snapshot — company, standing bid, clicks — for every slot.
+  // is_free is joined from slots (the layout row), never stored on holdings.
   app.get("/api/v1/holdings", async () => {
     const { rows } = await pool.query(
       `select h.slot_id, h.holding_uid, h.company_id, h.standing_bid_cents, h.paid_total_cents,
-              h.claimed_at, h.last_raise_at, h.clicks, h.impressions,
+              h.claimed_at, h.last_raise_at, h.clicks, h.impressions, s.is_free,
               c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
        from holdings h
+       join slots s on s.slot_id = h.slot_id
        left join companies c on c.company_id = h.company_id`,
     )
     return { holdings: rows }
@@ -58,15 +62,25 @@ export async function cityRoutes(app: FastifyInstance) {
   // uncached endpoint, exactly mirroring how /api/v1/holdings works for slots. Without this,
   // the frontend has no way to learn who owns which building except by having been connected
   // to the WebSocket at the exact instant a purchase happened.
+  //
+  // freeBuildingIds is returned alongside: unlike slots (which have a holdings row each, so
+  // /api/v1/holdings covers unclaimed ones too) this endpoint only lists *owned* buildings,
+  // so the free-tier flag for unclaimed buildings has to come through explicitly.
   app.get("/api/v1/building-owners", async () => {
-    const { rows } = await pool.query(
-      `select b.building_id, b.office_owner_id, b.office_name, b.purchased_at, b.price_cents,
-              c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
-       from buildings b
-       join companies c on c.company_id = b.office_owner_id
-       where b.office_owner_id is not null`,
-    )
-    return { buildings: rows }
+    const [owned, free] = await Promise.all([
+      pool.query(
+        `select b.building_id, b.office_owner_id, b.office_name, b.purchased_at, b.price_cents, b.is_free,
+                c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
+         from buildings b
+         join companies c on c.company_id = b.office_owner_id
+         where b.office_owner_id is not null`,
+      ),
+      pool.query(`select building_id from buildings where is_free`),
+    ])
+    return {
+      buildings: owned.rows,
+      freeBuildingIds: free.rows.map((r) => r.building_id as number),
+    }
   })
 
   // Live graveyard snapshot — every plot (claimed or not) with its default/owner label,
@@ -76,7 +90,7 @@ export async function cityRoutes(app: FastifyInstance) {
   app.get("/api/v1/graveyard", async () => {
     const { rows } = await pool.query(
       `select g.plot_id, g.company_id, g.name, g.story, g.domain, g.born, g.died,
-              g.standing_bid_cents, g.paid_total_cents, g.claimed_at, g.last_raise_at,
+              g.standing_bid_cents, g.paid_total_cents, g.claimed_at, g.last_raise_at, g.is_free,
               c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
        from graveyard_plots g
        left join companies c on c.company_id = g.company_id

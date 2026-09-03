@@ -34,9 +34,23 @@ async function main() {
     if (error instanceof ZodError) {
       return reply.code(400).send({ error: "validation_failed", message: error.message })
     }
-    const message = error instanceof Error ? error.message : "Internal Server Error"
+    // Respect the status a plugin already decided on. @fastify/rate-limit throws an Error
+    // carrying statusCode 429; hardcoding 500 here turned every throttle into a fake server
+    // error, so clients saw "Internal Server Error" and had nothing to back off on. Same for
+    // 404/405 and anything else Fastify raises with a 4xx.
+    const err = error as { statusCode?: number; name?: string; message?: string }
+    const status = typeof err.statusCode === "number" ? err.statusCode : 500
+    if (status < 500) {
+      return reply.code(status).send({
+        statusCode: status,
+        error: err.name && err.name !== "Error" ? err.name : "Request Failed",
+        message: err.message ?? "Request failed",
+      })
+    }
+    // Genuine server faults: log the detail, but don't echo internal messages (DB errors, SQL
+    // fragments, stack-adjacent text) back to the client.
     app.log.error(error)
-    return reply.code(500).send({ statusCode: 500, error: "Internal Server Error", message })
+    return reply.code(500).send({ statusCode: 500, error: "Internal Server Error" })
   })
 
   // Stripe needs the exact raw request bytes to verify the webhook signature,

@@ -1,5 +1,5 @@
 import "dotenv/config"
-import { readFileSync } from "node:fs"
+import { readFileSync, readdirSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 import { Pool } from "pg"
@@ -14,6 +14,18 @@ async function main() {
   console.log("Applying backend/src/schema.sql ...")
   await pool.query(sql)
   console.log("Schema applied.")
+
+  // Then apply every numbered migration in order. All migrations are written to be
+  // idempotent (IF NOT EXISTS / deterministic updates), so re-running is always safe.
+  const dir = join(__dirname, "../src/migrations")
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+  for (const file of files) {
+    console.log(`Applying migrations/${file} ...`)
+    await pool.query(readFileSync(join(dir, file), "utf8"))
+  }
+  console.log(`${files.length} migration(s) applied.`)
   await pool.end()
 }
 

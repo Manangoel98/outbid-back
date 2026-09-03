@@ -93,6 +93,41 @@ async function main() {
   const { rowCount: prunedSlots } = await pool.query(`delete from slots where kind in ('taxi','plane','boat','train')`)
   if (prunedSlots) console.log(`Pruned ${prunedSlots} non-sellable vehicle slot(s) and ${prunedHoldings} holding(s).`)
 
+  // Free tier seeding: randomly mark 50% of claimable items as free
+  // Total: 347 free items (50% of 694 total)
+  // - Slots: 287 free (50% of 574)
+  // - Buildings: 48 free (50% of 96)
+  // - Graveyard plots: 12 free (50% of 24)
+  console.log("Seeding free tier: marking exactly 50% of items as free...")
+
+  // Deterministic + idempotent 50/50 split, ordered by md5 of the id. Using `random() < 0.5`
+  // here was a bug: it only ever flipped rows to TRUE, so each re-run compounded the free set
+  // (it had drifted to 74% of slots / 67% of buildings / 92% of plots). Ranking by a stable
+  // hash instead means re-seeding always converges on the same exact half.
+  const splitFifty = async (table: string, idCol: string, idExpr: string) => {
+    const { rowCount } = await pool.query(
+      `with ranked as (
+         select ${idCol} as id,
+                row_number() over (order by md5(${idExpr})) as rn,
+                count(*) over () as total
+         from ${table}
+       )
+       update ${table} t
+       set is_free = (r.rn <= r.total / 2)
+       from ranked r
+       where t.${idCol} = r.id
+         and t.is_free <> (r.rn <= r.total / 2)`,
+    )
+    const { rows } = await pool.query<{ total: number; free: number }>(
+      `select count(*)::int total, count(*) filter (where is_free)::int free from ${table}`,
+    )
+    console.log(`${table}: ${rows[0].free}/${rows[0].total} free (${rowCount} row(s) changed).`)
+  }
+
+  await splitFifty("slots", "slot_id", "slot_id")
+  await splitFifty("buildings", "building_id", "building_id::text")
+  await splitFifty("graveyard_plots", "plot_id", "plot_id")
+
   // General staleness cleanup for future city redesigns (new vehicles/buildings added,
   // old ones renumbered/removed in generateCity.ts): any slot/building id that no longer
   // exists in the current city AND has never been paid for is safe to drop. Anything with
