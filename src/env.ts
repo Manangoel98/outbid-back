@@ -8,6 +8,18 @@ function required(name: string, fallback?: string) {
 
 export const env = {
   port: Number(process.env.PORT ?? 8787),
+  // Is there a real reverse proxy in front of us that we can trust to append X-Forwarded-For?
+  //
+  // This MUST be true in production and false anywhere the API is directly reachable. When there
+  // is no trusted proxy, a client's own X-Forwarded-For header becomes `req.ip` — verified — which
+  // means an attacker can mint a brand-new "visitor" per request and inflate analytics freely, and
+  // dodge every per-IP rate limit including checkout. Trusting one hop is only safe because the
+  // platform (Cloud Run / Render) appends its own entry that a client cannot forge.
+  //
+  // Defaults on in production so a deploy is safe by default, and off otherwise so local dev and
+  // any directly-exposed deployment fall back to the real socket address. See SECURITY.md
+  // Threat 8/14.
+  trustProxy: (process.env.TRUST_PROXY ?? (process.env.NODE_ENV === "production" ? "1" : "0")) === "1",
   databaseUrl: required("DATABASE_URL"),
   corsOrigins: (process.env.CORS_ORIGIN ?? "http://localhost:5173").split(",").map((s) => s.trim()),
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",

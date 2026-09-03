@@ -212,6 +212,31 @@ wrong in for a number people spend money against — under-counting understates 
 whereas over-counting means selling on numbers that aren't real. `scripts/verify-analytics.ts`
 asserts these properties, including that 50 rotated client ids add zero counts.
 
+### Residual weaknesses — what this does NOT stop
+
+Verified by probing the running server, not assumed:
+
+1. **User-agent rotation still mints visitors.** The hash includes the UA, so a script that sends a
+   different UA string per request gets a new identity each time and each request counts. Confirmed:
+   three requests with rotating fake UAs each returned `counted: 1`. Cost to the attacker is one
+   request per inflated walk-by, and the analytics rate limit (120/60s) is the only ceiling. Removing
+   UA from the hash would fix it but would collapse every device behind one NAT into a single
+   visitor, under-counting far more aggressively. **Not currently mitigated** — the honest framing is
+   that this raises the cost of inflation from "trivial" (rotate a localStorage value, unlimited) to
+   "requires distinct requests under a rate limit", rather than making it impossible.
+2. **`X-Forwarded-For` spoofing, if `trustProxy` is misconfigured.** With `trustProxy` on and no real
+   proxy in front, a client's own `X-Forwarded-For` becomes `req.ip` verbatim — so spoofing it mints
+   a fresh visitor *and* bypasses every per-IP rate limit, checkout included. This was a live bypass
+   until `trustProxy` was gated behind `env.trustProxy` (default on only when
+   `NODE_ENV=production`). **Deploy rule: `TRUST_PROXY=1` is only correct when the API is reachable
+   *exclusively* through the platform proxy.** If the Cloud Run/Render URL is also directly
+   reachable, an attacker can hit it and spoof the header.
+3. **A distributed attacker (many real IPs) can inflate counts.** Nothing here prevents that, and no
+   IP-based scheme can.
+
+The practical defence is that inflating a count has no direct payoff — it does not grant ownership,
+move money, or change pricing automatically. It only misleads a human buyer.
+
 ## What's implemented vs. still open
 
 | # | Threat | Status |
@@ -229,8 +254,9 @@ asserts these properties, including that 50 rotated client ids add zero counts.
 | 11 | Malformed/oversized input | ✅ zod + body limits + business caps |
 | 12 | Cross-origin abuse | ✅ CORS allowlist |
 | 13 | Anonymous identity | ✅ by design, N/A until free-edit features exist |
-| 14 | Faked impression/click counts | ✅ server-derived hash + DB-enforced dedup (migration 005) |
+| 14 | Faked impression/click counts | ⚠️ hardened, not airtight — see Threat 14 residuals |
 | — | DNS rebinding on logo proxy | ⚠️ residual, low severity, documented above |
+| — | Analytics: UA rotation can still inflate | ⚠️ known, unmitigated — see Threat 14 |
 | — | Analytics under-counts shared IPs | ⚠️ deliberate — see Threat 14 |
 | — | TLS/HTTPS | depends on host (Render/Vercel/Netlify/Railway all provide free TLS — make sure it's on) |
 | — | Secrets management | `.env` is gitignored everywhere; never commit real Stripe keys |

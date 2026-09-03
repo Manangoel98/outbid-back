@@ -13,26 +13,33 @@ import { statsRoutes } from "./routes/stats.js"
 import { pruneOldEvents } from "./lib/analytics.js"
 
 async function main() {
-  // trustProxy — Cloud Run terminates TLS and forwards with X-Forwarded-For, so without this
-  // every request's `req.ip` resolved to Google's front-end proxy. That made ALL the rate limits
-  // global instead of per-client: an 8/60s checkout limit meant only 8 checkouts per minute
+  // trustProxy — Cloud Run/Render terminate TLS and forward with X-Forwarded-For, so without this
+  // every request's `req.ip` resolved to the platform's front-end proxy. That made ALL the rate
+  // limits global instead of per-client: an 8/60s checkout limit meant only 8 checkouts per minute
   // could succeed worldwide, one script could lock every customer out of paying, and analytics
   // POSTs were being silently 429'd (which is why impression counts were near zero — not low
   // traffic, dropped writes).
   //
-  // Deliberately NOT `true`. Cloud Run *appends* to X-Forwarded-For rather than replacing it, so
-  // `true` would trust the whole chain and take the leftmost entry — which is client-supplied. A
-  // client could then send `X-Forwarded-For: 1.2.3.4` to dodge rate limits and forge the visitor
-  // identity that analytics dedup depends on.
+  // Deliberately NOT `true`. The platform *appends* to X-Forwarded-For rather than replacing it, so
+  // `true` would trust the whole chain and take the leftmost entry — which is client-supplied.
   //
-  // `(_addr, hop) => hop === 0` trusts exactly one hop, i.e. only the address Google itself
-  // appended, which a client cannot spoof. (Equivalent to the numeric `trustProxy: 1` that
-  // proxy-addr supports, expressed as a function because Fastify's types don't accept a number.)
+  // CRITICAL: trusting even one hop is only safe when a trusted proxy is actually in front.
+  // Verified locally with no proxy present, `X-Forwarded-For: 9.9.9.1` becomes req.ip verbatim — so
+  // a client could mint a fresh analytics visitor per request and bypass every per-IP rate limit,
+  // checkout included. Hence this is gated on env.trustProxy instead of being unconditional: with
+  // no proxy we use the real socket address, which cannot be forged. See SECURITY.md Threat 8/14.
   const app = Fastify({
     logger: true,
     bodyLimit: env.bodyLimitBytes,
-    trustProxy: (_address, hop) => hop === 0,
+    trustProxy: env.trustProxy ? (_address, hop) => hop === 0 : false,
   })
+
+  if (!env.trustProxy) {
+    app.log.warn(
+      "trustProxy DISABLED: using the raw socket address for rate limiting and analytics identity. " +
+        "Set TRUST_PROXY=1 only when a trusted reverse proxy (Cloud Run, Render, nginx) is in front.",
+    )
+  }
 
   await app.register(helmet, {
     // This is a JSON API with no HTML views, so CSP is irrelevant noise; the

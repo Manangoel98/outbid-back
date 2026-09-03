@@ -28,6 +28,11 @@ services:
       # the inflated impression/click counts the hash exists to prevent.
       - key: ANALYTICS_SALT
         generateValue: true
+      # Render routes all traffic through its proxy, so trusting one hop of X-Forwarded-For is
+      # correct here and is what makes rate limits per-client rather than global. Do NOT set this
+      # where the service is also directly reachable — see SECURITY.md Threat 8/14.
+      - key: TRUST_PROXY
+        value: 1
       # Read-only routes are consumed by the SEO edge functions and crawlers from a small pool of
       # shared IPs, so they need a much larger budget than the strict write limit. See Threat 8.
       - key: READ_RATE_LIMIT_MAX

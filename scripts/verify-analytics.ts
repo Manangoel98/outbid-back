@@ -273,6 +273,31 @@ async function main() {
       `status ${onlyBogus.status} counted=${String(onlyBogusBody.counted)}`,
     )
 
+    // X-Forwarded-For must not be usable to mint new visitors. This is environment-dependent and
+    // was a genuine bypass: with trustProxy on but no real proxy in front, a client's own
+    // X-Forwarded-For becomes req.ip verbatim, so each spoofed value counted as a fresh visitor.
+    // env.trustProxy now gates that, so locally the raw socket address is used and spoofing is inert.
+    let xffCounted = 0
+    for (const fake of ["9.9.9.101", "9.9.9.102", "9.9.9.103"]) {
+      const res = await fetch(`${API_URL}/api/v1/analytics/passes`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin,
+          "user-agent": browserUA,
+          "x-forwarded-for": fake,
+        },
+        body: JSON.stringify({ slots: [slotId] }),
+      })
+      const b = (await res.json().catch(() => ({}))) as { counted?: number }
+      xffCounted += b.counted ?? 0
+    }
+    check(
+      "spoofed X-Forwarded-For cannot mint new visitors",
+      xffCounted === 0,
+      `added ${xffCounted} (expected 0 when no trusted proxy is in front)`,
+    )
+
     // A visit must name exactly one placement, matching the table's check constraint.
     const bothRes = await fetch(`${API_URL}/api/v1/analytics/visit`, {
       method: "POST",
