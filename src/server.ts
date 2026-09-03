@@ -10,9 +10,29 @@ import { checkoutRoutes } from "./routes/checkout.js"
 import { webhookRoutes } from "./routes/webhook.js"
 import { wsRoutes } from "./routes/ws.js"
 import { statsRoutes } from "./routes/stats.js"
+import { pruneOldEvents } from "./lib/analytics.js"
 
 async function main() {
-  const app = Fastify({ logger: true, bodyLimit: env.bodyLimitBytes })
+  // trustProxy — Cloud Run terminates TLS and forwards with X-Forwarded-For, so without this
+  // every request's `req.ip` resolved to Google's front-end proxy. That made ALL the rate limits
+  // global instead of per-client: an 8/60s checkout limit meant only 8 checkouts per minute
+  // could succeed worldwide, one script could lock every customer out of paying, and analytics
+  // POSTs were being silently 429'd (which is why impression counts were near zero — not low
+  // traffic, dropped writes).
+  //
+  // Deliberately NOT `true`. Cloud Run *appends* to X-Forwarded-For rather than replacing it, so
+  // `true` would trust the whole chain and take the leftmost entry — which is client-supplied. A
+  // client could then send `X-Forwarded-For: 1.2.3.4` to dodge rate limits and forge the visitor
+  // identity that analytics dedup depends on.
+  //
+  // `(_addr, hop) => hop === 0` trusts exactly one hop, i.e. only the address Google itself
+  // appended, which a client cannot spoof. (Equivalent to the numeric `trustProxy: 1` that
+  // proxy-addr supports, expressed as a function because Fastify's types don't accept a number.)
+  const app = Fastify({
+    logger: true,
+    bodyLimit: env.bodyLimitBytes,
+    trustProxy: (_address, hop) => hop === 0,
+  })
 
   await app.register(helmet, {
     // This is a JSON API with no HTML views, so CSP is irrelevant noise; the
@@ -66,6 +86,24 @@ async function main() {
     }
   })
 
+  // navigator.sendBeacon is the only transport that reliably completes after a tab closes, so the
+  // frontend uses it for the final analytics flush of a session. It must send a CORS-safelisted
+  // content type (text/plain) to avoid a preflight it cannot recover from — see the comment in
+  // frontend/src/net/api.ts. The payload is still JSON, so parse it as such.
+  //
+  // Scoped narrowly: only bodies that actually look like a JSON object are accepted, and a parse
+  // failure yields an empty body rather than a 400, because a beacon has no way to retry or even
+  // observe an error.
+  app.addContentTypeParser("text/plain", { parseAs: "string" }, (_req, body, done) => {
+    const text = typeof body === "string" ? body.trim() : ""
+    if (!text.startsWith("{")) return done(null, {})
+    try {
+      done(null, JSON.parse(text))
+    } catch {
+      done(null, {})
+    }
+  })
+
   await app.register(cityRoutes)
   await app.register(checkoutRoutes)
   await app.register(webhookRoutes)
@@ -73,6 +111,28 @@ async function main() {
   await app.register(statsRoutes)
 
   app.get("/healthz", async () => ({ ok: true }))
+
+  // Retention for the raw analytics event log. ad_events grows with every counted walk-by, so
+  // without pruning it would grow without bound; the permanent totals live in the counter columns
+  // on holdings/buildings, so pruning only drops the ability to compute windows further back than
+  // the retention period.
+  //
+  // Runs in-process on an interval rather than as an external cron: there is no scheduler in this
+  // deployment, and a delete-by-timestamp on an indexed column is cheap enough that a dedicated
+  // job would be more moving parts than the problem justifies. If multiple instances run, they
+  // simply each try — the delete is idempotent, so a concurrent run is harmless.
+  //
+  // unref() so this timer never holds the process open during shutdown.
+  const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
+  const pruneTimer = setInterval(() => {
+    void pruneOldEvents()
+      .then((n) => {
+        if (n > 0) app.log.info({ pruned: n }, "pruned expired ad_events")
+      })
+      // A failed prune must never take the API down — it is housekeeping, not request-path work.
+      .catch((err) => app.log.error({ err }, "ad_events prune failed"))
+  }, PRUNE_INTERVAL_MS)
+  pruneTimer.unref()
 
   await app.listen({ port: env.port, host: "0.0.0.0" })
   app.log.info(`Outbid City API listening on :${env.port}`)

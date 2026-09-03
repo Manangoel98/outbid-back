@@ -1,34 +1,24 @@
 import type { FastifyInstance } from "fastify"
+import type { PoolClient } from "pg"
 import { pool } from "../lib/db.js"
 import { publish } from "../lib/bus.js"
 import { env } from "../env.js"
+import { buildingStats, recordEvent, slotStats, type Placement } from "../lib/analytics.js"
+import {
+  bucketStart,
+  hasAllowedOrigin,
+  isBotRequest,
+  PASS_WINDOW_MS,
+  visitorHash,
+  VISIT_WINDOW_MS,
+} from "../lib/visitor.js"
 
-// In-memory rate limiting: key = "visitorId:slotId", value = timestamp of last accepted event.
-// At most 1 impression per visitorId+slotId per 30 min, 1 click per 10 min.
-const impRateMap = new Map<string, number>()
-const clickRateMap = new Map<string, number>()
-const IMP_WINDOW_MS = 30 * 60 * 1000
-const CLICK_WINDOW_MS = 10 * 60 * 1000
-
-// Hard caps so a hostile client can't (a) blow up the in-memory maps with unbounded unique
-// keys, or (b) send pathologically large ids. slotId/visitorId are short by design.
+// Hard caps so a hostile client can't send pathologically large ids. slotId/visitorId are short
+// by design.
 const MAX_ID_LEN = 128
-const MAX_RATE_MAP_ENTRIES = 50_000
 
 function validId(v: unknown): v is string {
   return typeof v === "string" && v.length > 0 && v.length <= MAX_ID_LEN
-}
-
-// Evict oldest entries if a map grows past the cap (crude but bounded; these maps are a
-// best-effort dedupe, not a source of truth).
-function capMap(m: Map<string, number>) {
-  if (m.size <= MAX_RATE_MAP_ENTRIES) return
-  const drop = m.size - MAX_RATE_MAP_ENTRIES
-  let i = 0
-  for (const k of m.keys()) {
-    m.delete(k)
-    if (++i >= drop) break
-  }
 }
 
 export async function cityRoutes(app: FastifyInstance) {
@@ -77,19 +67,30 @@ export async function cityRoutes(app: FastifyInstance) {
   // /api/v1/holdings covers unclaimed ones too) this endpoint only lists *owned* buildings,
   // so the free-tier flag for unclaimed buildings has to come through explicitly.
   app.get("/api/v1/building-owners", { config: { rateLimit: readRateLimit } }, async () => {
-    const [owned, free] = await Promise.all([
+    const [owned, free, traffic] = await Promise.all([
       pool.query(
         `select b.building_id, b.office_owner_id, b.office_name, b.purchased_at, b.price_cents, b.is_free,
+                b.clicks, b.impressions,
                 c.name as company_name, c.url as company_url, c.tagline, c.logo_url, c.primary_color, c.ink_color
          from buildings b
          join companies c on c.company_id = b.office_owner_id
          where b.office_owner_id is not null`,
       ),
       pool.query(`select building_id from buildings where is_free`),
+      // Traffic for UNOWNED buildings too. Walk-bys accrue whether or not a building is claimed,
+      // and "this tower already gets N walk-bys" is the strongest argument for buying it — but the
+      // owned-buildings join above can't carry it, so it needs its own row set. Filtered to
+      // buildings with actual traffic so the payload stays proportional to real activity rather
+      // than to the size of the city.
+      pool.query(
+        `select building_id, clicks, impressions from buildings
+         where office_owner_id is null and (impressions > 0 or clicks > 0)`,
+      ),
     ])
     return {
       buildings: owned.rows,
       freeBuildingIds: free.rows.map((r) => r.building_id as number),
+      traffic: traffic.rows,
     }
   })
 
@@ -127,7 +128,11 @@ export async function cityRoutes(app: FastifyInstance) {
        from orders where $1 = any(slot_ids) order by created_at desc limit 20`,
         [req.params.slotId],
       )
-      return { holding: rows[0], history }
+      // Windowed stats ride along so the crawler-facing /holding/:id page and the in-game bid
+      // panel both quote the same figures from the same source — no second round trip, no chance
+      // of the public page and the game disagreeing about what a placement is worth.
+      const stats = await slotStats(req.params.slotId)
+      return { holding: rows[0], history, stats }
     },
   )
 
@@ -139,61 +144,181 @@ export async function cityRoutes(app: FastifyInstance) {
     return rows[0]
   })
 
-  // Analytics: record an impression (walk-by) for a slot.
-  // Rate-limited: once per visitorId+slotId per 30 min (in-memory, ephemeral across restarts).
-  app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/impression", async (req, reply) => {
-    const { slotId, visitorId } = req.body ?? {}
-    if (!validId(slotId) || !validId(visitorId)) return reply.code(400).send({ error: "missing_fields" })
-    const key = `${visitorId}:${slotId}`
-    const now = Date.now()
-    const last = impRateMap.get(key) ?? 0
-    if (now - last < IMP_WINDOW_MS) return { ok: false, reason: "rate_limited" }
-    impRateMap.set(key, now)
-    capMap(impRateMap)
-    const { rows } = await pool.query(
-      `update holdings set impressions = impressions + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
-      [slotId],
-    )
-    if (!rows[0]) return reply.code(404).send({ error: "not_found" })
-    publish({
-      type: "holding",
-      slotId: rows[0].slot_id,
-      companyId: null,
-      standingBidCents: -1,
-      claimedAt: null,
-      company: null,
-      impressions: rows[0].impressions,
-      clicks: rows[0].clicks,
-    } as Parameters<typeof publish>[0])
-    return { ok: true }
+  // ---------------------------------------------------------------------------------------
+  // Analytics
+  //
+  // Both endpoints derive the visitor identity server-side and let a unique index in Postgres
+  // enforce dedup (see lib/visitor.ts and lib/analytics.ts). The client-supplied id is accepted
+  // but only stored for diagnostics — it is never part of the dedup key, because it is
+  // attacker-chosen and rotating it was previously enough to inflate any placement freely.
+  // ---------------------------------------------------------------------------------------
+
+  const analyticsRateLimit = {
+    max: env.analyticsRateLimitMax,
+    timeWindow: env.analyticsRateLimitWindowMs,
+  }
+
+  /** Shared guard: reject anything that is not a real browser on one of our own pages. */
+  function analyticsAllowed(req: Parameters<typeof visitorHash>[0]) {
+    if (isBotRequest(req)) return false
+    if (!hasAllowedOrigin(req)) return false
+    return true
+  }
+
+  // Record walk-bys in BATCHES. The player passes several surfaces at once, and the previous
+  // one-POST-per-surface design fired up to 8 requests every 2 seconds — which, against a
+  // shared rate limit, meant most walk-bys were silently 429'd rather than recorded. One
+  // request per scan makes the limit non-binding and lets the server collapse duplicates
+  // inside a payload before touching the database.
+  app.post<{
+    Body: { slots?: string[]; buildings?: number[]; visitorId?: string }
+  }>("/api/v1/analytics/passes", { config: { rateLimit: analyticsRateLimit } }, async (req, reply) => {
+    if (!analyticsAllowed(req)) return reply.code(204).send()
+
+    const body = req.body ?? {}
+    const rawSlots = Array.isArray(body.slots) ? body.slots : []
+    const rawBuildings = Array.isArray(body.buildings) ? body.buildings : []
+
+    // Dedupe within the request and hard-cap the batch, so one call can never fan out into an
+    // unbounded number of upserts.
+    const slotIds = [...new Set(rawSlots.filter(validId))].slice(0, env.analyticsMaxBatch)
+    const buildingIds = [
+      ...new Set(rawBuildings.filter((b) => Number.isInteger(b) && b >= 0)),
+    ].slice(0, env.analyticsMaxBatch)
+
+    if (!slotIds.length && !buildingIds.length) return { ok: true, counted: 0 }
+
+    const hash = visitorHash(req)
+    const bucket = bucketStart(PASS_WINDOW_MS)
+    const clientId = validId(body.visitorId) ? body.visitorId! : null
+
+    let counted = 0
+    const client = await pool.connect()
+    try {
+      for (const slotId of slotIds) {
+        const res = await recordPassSafely(client, { slotId }, hash, bucket, clientId)
+        if (res) counted++
+      }
+      for (const buildingId of buildingIds) {
+        const res = await recordPassSafely(client, { buildingId }, hash, bucket, clientId)
+        if (res) counted++
+      }
+    } finally {
+      client.release()
+    }
+
+    return { ok: true, counted }
   })
 
-  // Analytics: record a click (visit) for a slot.
-  // Rate-limited: once per visitorId+slotId per 10 min (in-memory, ephemeral across restarts).
-  app.post<{ Body: { slotId: string; visitorId: string } }>("/api/v1/analytics/click", async (req, reply) => {
-    const { slotId, visitorId } = req.body ?? {}
-    if (!validId(slotId) || !validId(visitorId)) return reply.code(400).send({ error: "missing_fields" })
-    const key = `${visitorId}:${slotId}`
-    const now = Date.now()
-    const last = clickRateMap.get(key) ?? 0
-    if (now - last < CLICK_WINDOW_MS) return { ok: false, reason: "rate_limited" }
-    clickRateMap.set(key, now)
-    capMap(clickRateMap)
-    const { rows } = await pool.query(
-      `update holdings set clicks = clicks + 1 where slot_id = $1 returning slot_id, impressions, clicks`,
-      [slotId],
-    )
-    if (!rows[0]) return reply.code(404).send({ error: "not_found" })
-    publish({
-      type: "holding",
-      slotId: rows[0].slot_id,
-      companyId: null,
-      standingBidCents: -1,
-      claimedAt: null,
-      company: null,
-      impressions: rows[0].impressions,
-      clicks: rows[0].clicks,
-    } as Parameters<typeof publish>[0])
-    return { ok: true }
+  /** Record one pass, skipping placements that no longer exist instead of failing the batch.
+   *
+   *  A batch is built from the client's cached city layout, so it can legitimately contain an id
+   *  that has since been removed — which Postgres rejects with a foreign-key violation (23503).
+   *  Letting that propagate would return 500 and discard every *valid* pass in the same batch,
+   *  so a single stale id would silently wipe out real walk-by data for the surfaces around it.
+   *  Each recordEvent runs as its own implicit transaction (no BEGIN here), so a failed insert
+   *  does not poison the ones that follow.
+   *
+   *  Only 23503 is swallowed. Any other error still propagates, because a genuine database fault
+   *  must not be quietly converted into "counted nothing". */
+  async function recordPassSafely(
+    client: PoolClient,
+    placement: Placement,
+    hash: string,
+    bucket: Date,
+    clientId: string | null,
+  ) {
+    try {
+      const res = await recordEvent(client, placement, "pass", hash, bucket, clientId)
+      return res.counted
+    } catch (err) {
+      if ((err as { code?: string }).code === "23503") {
+        app.log.warn({ placement }, "analytics pass for unknown placement, skipped")
+        return false
+      }
+      throw err
+    }
+  }
+
+  // Record a visit (click-through to the advertiser). Handles buildings too — previously the
+  // click handler only fired when a slotId was present, so every office tower reported zero
+  // visits permanently despite being the most expensive placement in the game.
+  app.post<{
+    Body: { slotId?: string; buildingId?: number; visitorId?: string }
+  }>("/api/v1/analytics/visit", { config: { rateLimit: analyticsRateLimit } }, async (req, reply) => {
+    if (!analyticsAllowed(req)) return reply.code(204).send()
+
+    const body = req.body ?? {}
+    const hasSlot = validId(body.slotId)
+    const hasBuilding = Number.isInteger(body.buildingId) && (body.buildingId as number) >= 0
+    // Exactly one placement, matching the table's check constraint.
+    if (hasSlot === hasBuilding) return reply.code(400).send({ error: "one_placement_required" })
+
+    const hash = visitorHash(req)
+    const bucket = bucketStart(VISIT_WINDOW_MS)
+    const clientId = validId(body.visitorId) ? body.visitorId! : null
+    const placement = hasSlot
+      ? { slotId: body.slotId as string }
+      : { buildingId: body.buildingId as number }
+
+    const client = await pool.connect()
+    let counted = false
+    try {
+      const res = await recordEvent(client, placement, "visit", hash, bucket, clientId)
+      counted = res.counted
+    } catch (err) {
+      // A foreign-key violation means the placement id does not exist.
+      if ((err as { code?: string }).code === "23503") {
+        return reply.code(404).send({ error: "not_found" })
+      }
+      throw err
+    } finally {
+      client.release()
+    }
+
+    // Only broadcast when the count actually moved, so a deduped no-op does not churn every
+    // connected client's UI.
+    if (counted && hasSlot) {
+      const { rows } = await pool.query(
+        `select slot_id, impressions, clicks from holdings where slot_id = $1`,
+        [body.slotId],
+      )
+      if (rows[0]) {
+        publish({
+          type: "holding",
+          slotId: rows[0].slot_id,
+          companyId: null,
+          standingBidCents: -1,
+          claimedAt: null,
+          company: null,
+          impressions: rows[0].impressions,
+          clicks: rows[0].clicks,
+        } as Parameters<typeof publish>[0])
+      }
+    }
+
+    return { ok: true, counted }
   })
+
+  // Public per-placement stats: all-time, rolling 7 days, and CTR. These are the numbers shown
+  // in the bid panel and on the crawler-facing holding/building pages, so they must come from
+  // the same source of truth as everything else.
+  app.get<{ Params: { slotId: string } }>(
+    "/api/v1/analytics/slot/:slotId",
+    { config: { rateLimit: readRateLimit } },
+    async (req, reply) => {
+      if (!validId(req.params.slotId)) return reply.code(400).send({ error: "bad_id" })
+      return await slotStats(req.params.slotId)
+    },
+  )
+
+  app.get<{ Params: { buildingId: string } }>(
+    "/api/v1/analytics/building/:buildingId",
+    { config: { rateLimit: readRateLimit } },
+    async (req, reply) => {
+      const id = Number(req.params.buildingId)
+      if (!Number.isInteger(id) || id < 0) return reply.code(400).send({ error: "bad_id" })
+      return await buildingStats(id)
+    },
+  )
 }

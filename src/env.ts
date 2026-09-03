@@ -26,6 +26,21 @@ export const env = {
   // limit; see SECURITY.md Threat 8.
   readRateLimitMax: Number(process.env.READ_RATE_LIMIT_MAX ?? 300),
   readRateLimitWindowMs: Number(process.env.READ_RATE_LIMIT_WINDOW_MS ?? 60_000),
+  // Analytics writes are high-frequency by nature: a player walking through the city passes
+  // many surfaces, and passes are reported in batches every couple of seconds. They are cheap
+  // (one upsert per new event) and must not share a budget with checkout, or normal play would
+  // throttle purchases. Abuse is bounded by the server-side visitor hash + per-batch cap
+  // rather than by a tight request limit, since a tight limit only loses real data.
+  analyticsRateLimitMax: Number(process.env.ANALYTICS_RATE_LIMIT_MAX ?? 120),
+  analyticsRateLimitWindowMs: Number(process.env.ANALYTICS_RATE_LIMIT_WINDOW_MS ?? 60_000),
+  // Max placements accepted in a single /analytics/passes batch. The client reports at most
+  // ~8 nearby surfaces per scan; this is a hard server-side bound so a hostile client cannot
+  // send a 10k-element array and turn one request into 10k upserts.
+  analyticsMaxBatch: Number(process.env.ANALYTICS_MAX_BATCH ?? 24),
+  // Rotating salt for the visitor hash. Set ANALYTICS_SALT in production: without it the salt
+  // is random per process, so dedup would reset on every cold start and multiple Cloud Run
+  // instances would each count the same visitor once.
+  analyticsSalt: process.env.ANALYTICS_SALT ?? "",
   bodyLimitBytes: Number(process.env.BODY_LIMIT_BYTES ?? 256 * 1024),
   // Stripe's own ceiling for USD Checkout is $999,999.99; we cap well below that as a
   // sanity bound so a stray extra zero can't create a runaway charge. Real bids in this

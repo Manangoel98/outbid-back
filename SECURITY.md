@@ -114,6 +114,20 @@ throttled itself within a handful of pages, and a throttled read becomes a 503 f
 i.e. the rate limiter was silently suppressing indexing. Writes are unaffected and still strict,
 which is where the actual abuse risk lives.
 
+Analytics writes get a third budget (`ANALYTICS_RATE_LIMIT_MAX`, default 120/60s). They are
+high-frequency by nature and must not share the checkout budget, or ordinary play would throttle
+purchases. Their abuse resistance comes from the visitor hash and per-batch cap in Threat 14, not
+from a tight request limit — a tight limit there only discards real data.
+
+**Prerequisite for all of the above: `trustProxy`.** Cloud Run terminates TLS and forwards with
+`X-Forwarded-For`, so without it `req.ip` was Google's front-end proxy for *every* request. That
+made all these limits **global rather than per-client**: the checkout limit meant only N checkouts
+per minute could succeed worldwide, so one script could lock every customer out of paying, and
+analytics POSTs were being silently 429'd. `server.ts` sets `trustProxy: (_addr, hop) => hop === 0`
+— deliberately one hop, not `true`. Cloud Run *appends* to `X-Forwarded-For`, so trusting the whole
+chain would take the leftmost, client-supplied entry, letting a client set `X-Forwarded-For` to
+dodge rate limits and forge the analytics visitor identity.
+
 ## Threat 9 — Fleet bulk-buy race (multiple slots at once)
 
 **Attack:** Two companies both buy "5 taxis" at the same moment — naive "pick 5 open slots" logic
@@ -156,6 +170,48 @@ money). The anonymous `visitor_id` is only ever used for cosmetic convenience (e
 free edits (e.g. renaming a tagline without re-paying), that's the moment a real per-company
 secret/session token needs to be introduced — flagged in `BACKEND_PLAN.md` §6, not yet needed.
 
+## Threat 14 — Faking impression / click numbers
+
+**Attack:** Walk-bys and visits are published on every holding page, on the leaderboard, and in the
+bid panel. Buyers use them to decide what a placement is worth, so inflating them is a way to sell a
+worthless spot at a high price — or to make a rival's spot look good and bait them into overpaying.
+
+**Why the original design was fully forgeable:** dedup was keyed on a `visitorId` sent in the
+request body and stored in two in-memory `Map`s. That meant:
+
+- The key was **attacker-chosen** — a loop with a fresh random id per iteration added one impression
+  each, without limit.
+- The maps were **per-process**, so Cloud Run cold starts wiped all dedup state and multiple
+  instances deduped independently — the same real visitor counted once per instance, per restart.
+- The counters were **not recomputable**: once a number was wrong there was no evidence left to
+  rebuild it from.
+
+**Mitigation (migration 005 + `lib/visitor.ts` + `lib/analytics.ts`):**
+
+1. **Server-derived identity.** The dedup key is `sha256(daily salt + client IP + user-agent)`. The
+   client-supplied id is still accepted but only stored as `ad_events.client_id` for diagnostics and
+   is deliberately *not* part of any unique index. This relies on `trustProxy` being one hop (see
+   Threat 8) — with `trustProxy: true` the IP would be client-supplied and this guarantee collapses.
+2. **Dedup as a database constraint.** Every counted event is a row in `ad_events`, with partial
+   unique indexes on `(placement, kind, visitor_hash, bucket_start)`. Insert and counter-increment
+   happen in one CTE, so the counter only moves when the insert actually created a row — correct
+   across instances and restarts, with no application-side check-then-act to race.
+3. **Bounded batches.** `/analytics/passes` dedupes within the payload and hard-caps it at
+   `ANALYTICS_MAX_BATCH`, so one request cannot fan out into unbounded upserts.
+4. **Bot and origin filtering.** Known crawler UAs and requests without an allow-listed `Origin` are
+   refused. This matters more than usual because these counts are published *to* crawlers on the SEO
+   pages, so a crawler-inflated count would feed itself. This is a cheap filter, not a boundary —
+   the real protection is (1) and (2).
+5. **CTR suppressed on small samples.** Below 20 walk-bys the ratio is reported as `null` rather than
+   as a percentage, because "33% CTR" from 3 passes is noise presented as insight to someone deciding
+   what to pay.
+
+**Accepted, deliberate limitation:** IP+UA hashing **under-counts**. Everyone behind one office NAT,
+carrier gateway or VPN exit collapses into a single visitor. That is the correct direction to be
+wrong in for a number people spend money against — under-counting understates a placement's value,
+whereas over-counting means selling on numbers that aren't real. `scripts/verify-analytics.ts`
+asserts these properties, including that 50 rotated client ids add zero counts.
+
 ## What's implemented vs. still open
 
 | # | Threat | Status |
@@ -167,12 +223,14 @@ secret/session token needs to be introduced — flagged in `BACKEND_PLAN.md` §6
 | 5 | Client price tampering | ✅ server recomputes minimum |
 | 6 | SSRF via logo proxy | ✅ hostname/IP-range guard + content-type/size cap |
 | 7 | Abusive content | ✅ server-side filter (moderation.ts) |
-| 8 | Bot/DoS on checkout | ✅ rate limiting |
+| 8 | Bot/DoS on checkout | ✅ rate limiting (per-client, via one-hop `trustProxy`) |
 | 9 | Fleet buy race | ✅ `FOR UPDATE SKIP LOCKED` |
 | 10 | Building buy race | ✅ optimistic lock |
 | 11 | Malformed/oversized input | ✅ zod + body limits + business caps |
 | 12 | Cross-origin abuse | ✅ CORS allowlist |
 | 13 | Anonymous identity | ✅ by design, N/A until free-edit features exist |
+| 14 | Faked impression/click counts | ✅ server-derived hash + DB-enforced dedup (migration 005) |
 | — | DNS rebinding on logo proxy | ⚠️ residual, low severity, documented above |
+| — | Analytics under-counts shared IPs | ⚠️ deliberate — see Threat 14 |
 | — | TLS/HTTPS | depends on host (Render/Vercel/Netlify/Railway all provide free TLS — make sure it's on) |
 | — | Secrets management | `.env` is gitignored everywhere; never commit real Stripe keys |

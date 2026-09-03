@@ -21,6 +21,20 @@ services:
         value: https://outbidcity.lol/checkout/cancel
       - key: CORS_ORIGIN
         value: https://outbidcity.lol
+      # Salt for the server-derived analytics visitor hash (SECURITY.md Threat 14). generateValue
+      # lets Render create and store a random secret, so it never lives in the repo. It must be a
+      # single stable value shared by every instance: if it were random per process, dedup would
+      # reset on each cold start and each instance would recount the same visitor, re-introducing
+      # the inflated impression/click counts the hash exists to prevent.
+      - key: ANALYTICS_SALT
+        generateValue: true
+      # Read-only routes are consumed by the SEO edge functions and crawlers from a small pool of
+      # shared IPs, so they need a much larger budget than the strict write limit. See Threat 8.
+      - key: READ_RATE_LIMIT_MAX
+        value: 300
+      # Analytics writes are high-frequency by nature and must not share the checkout budget.
+      - key: ANALYTICS_RATE_LIMIT_MAX
+        value: 120
 
 databases:
   - name: outbid-city-db
