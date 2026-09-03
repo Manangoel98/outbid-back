@@ -13,5 +13,11 @@
     "sourceMap": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "scripts"]
+  "include": ["src", "scripts"],
+  // verify-city-parity.ts imports the frontend's city generator to diff it against the live DB.
+  // The frontend is a SEPARATE repository, so that path does not exist in a clean backend clone and
+  // its .tsx/DOM-typed dependencies are outside this project's `lib`. It runs fine under tsx locally
+  // (which resolves and transpiles on the fly) but cannot be part of the compiled build, so it is
+  // excluded here rather than weakening moduleResolution for the whole backend.
+  "exclude": ["scripts/verify-city-parity.ts"]
 }
