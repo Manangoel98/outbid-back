@@ -102,8 +102,17 @@ grief real users (making everything constantly "just got outbid"), or simply to 
 API usage / DB load.
 
 **Mitigation:** `@fastify/rate-limit` on every write route (`checkout.*`, `webhook`), keyed by
-IP, in `server.ts`. Read-only routes (`/city`, `/holdings`) are cheap and cached
-(`cache-control` header) so they're a lower priority target, but still capped.
+IP, in `server.ts`. Read-only routes (`/city`, `/holdings`, `/building-owners`, `/graveyard`,
+`/holdings/:slotId`) are cheap and cached (`cache-control` header) so they're a lower priority
+target, but still capped — with their own, larger budget (`READ_RATE_LIMIT_MAX`, default 300/60s)
+rather than the strict write budget (`RATE_LIMIT_MAX`, default 20/60s).
+
+That split is deliberate. The SEO edge functions render `/holding/*`, `/building/*`, `/leaderboard`
+and friends by calling these read routes 2–3 times per page, and search/AI crawlers reach them from
+a small pool of shared egress IPs. Under the 20/60s write budget a crawler walking the sitemap
+throttled itself within a handful of pages, and a throttled read becomes a 503 for that crawler —
+i.e. the rate limiter was silently suppressing indexing. Writes are unaffected and still strict,
+which is where the actual abuse risk lives.
 
 ## Threat 9 — Fleet bulk-buy race (multiple slots at once)
 

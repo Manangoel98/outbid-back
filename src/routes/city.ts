@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify"
 import { pool } from "../lib/db.js"
 import { publish } from "../lib/bus.js"
+import { env } from "../env.js"
 
 // In-memory rate limiting: key = "visitorId:slotId", value = timestamp of last accepted event.
 // At most 1 impression per visitorId+slotId per 30 min, 1 click per 10 min.
@@ -31,10 +32,19 @@ function capMap(m: Map<string, number>) {
 }
 
 export async function cityRoutes(app: FastifyInstance) {
+  // Read-only snapshot routes get a far larger budget than the strict global (write-oriented)
+  // limit. See env.readRateLimitMax for why: the SEO edge functions and search/AI crawlers all
+  // arrive from shared egress IPs and spend 2-3 reads per rendered page, so the write budget
+  // throttled legitimate crawling. These routes are cached and cheap.
+  const readRateLimit = {
+    max: env.readRateLimitMax,
+    timeWindow: env.readRateLimitWindowMs,
+  }
+
   // Static layout — cacheable, only changes when city_version bumps.
   // is_free ships here (not on the live endpoints) because it is immutable layout data:
   // this is what lets the client mark *unclaimed* free spots, which is the whole point.
-  app.get("/api/v1/city", async (_req, reply) => {
+  app.get("/api/v1/city", { config: { rateLimit: readRateLimit } }, async (_req, reply) => {
     const [slots, buildings] = await Promise.all([
       pool.query(`select slot_id, kind, tier, floor_cents, district, name, w, h, meta, is_free from slots order by slot_id`),
       pool.query(`select building_id, x, z, w, d, h, district, floors, is_free from buildings order by building_id`),
@@ -45,7 +55,7 @@ export async function cityRoutes(app: FastifyInstance) {
 
   // Live occupancy snapshot — company, standing bid, clicks — for every slot.
   // is_free is joined from slots (the layout row), never stored on holdings.
-  app.get("/api/v1/holdings", async () => {
+  app.get("/api/v1/holdings", { config: { rateLimit: readRateLimit } }, async () => {
     const { rows } = await pool.query(
       `select h.slot_id, h.holding_uid, h.company_id, h.standing_bid_cents, h.paid_total_cents,
               h.claimed_at, h.last_raise_at, h.clicks, h.impressions, s.is_free,
@@ -66,7 +76,7 @@ export async function cityRoutes(app: FastifyInstance) {
   // freeBuildingIds is returned alongside: unlike slots (which have a holdings row each, so
   // /api/v1/holdings covers unclaimed ones too) this endpoint only lists *owned* buildings,
   // so the free-tier flag for unclaimed buildings has to come through explicitly.
-  app.get("/api/v1/building-owners", async () => {
+  app.get("/api/v1/building-owners", { config: { rateLimit: readRateLimit } }, async () => {
     const [owned, free] = await Promise.all([
       pool.query(
         `select b.building_id, b.office_owner_id, b.office_name, b.purchased_at, b.price_cents, b.is_free,
@@ -87,7 +97,7 @@ export async function cityRoutes(app: FastifyInstance) {
   // story and bid. Uncached and real-time like /api/v1/building-owners: ownership changes
   // via Stripe. The default dead-startup label lives on the plot row (seeded), so this one
   // query serves both the classic tombstones and any user-buried startup uniformly.
-  app.get("/api/v1/graveyard", async () => {
+  app.get("/api/v1/graveyard", { config: { rateLimit: readRateLimit } }, async () => {
     const { rows } = await pool.query(
       `select g.plot_id, g.company_id, g.name, g.story, g.domain, g.born, g.died,
               g.standing_bid_cents, g.paid_total_cents, g.claimed_at, g.last_raise_at, g.is_free,
@@ -99,21 +109,27 @@ export async function cityRoutes(app: FastifyInstance) {
     return { plots: rows }
   })
 
-  app.get<{ Params: { slotId: string } }>("/api/v1/holdings/:slotId", async (req, reply) => {
-    const { rows } = await pool.query(
-      `select h.*, c.name as company_name, c.url as company_url from holdings h
+  app.get<{ Params: { slotId: string } }>(
+    "/api/v1/holdings/:slotId",
+    { config: { rateLimit: readRateLimit } },
+    async (req, reply) => {
+      const { rows } = await pool.query(
+        `select h.*, c.name as company_name, c.url as company_url, c.tagline,
+                c.logo_url, c.primary_color, c.ink_color
+       from holdings h
        left join companies c on c.company_id = h.company_id
        where h.slot_id = $1`,
-      [req.params.slotId],
-    )
-    if (!rows[0]) return reply.code(404).send({ error: "not_found" })
-    const { rows: history } = await pool.query(
-      `select order_id, total_cents, price_per_unit_cents, quantity, kind, created_at, status
+        [req.params.slotId],
+      )
+      if (!rows[0]) return reply.code(404).send({ error: "not_found" })
+      const { rows: history } = await pool.query(
+        `select order_id, total_cents, price_per_unit_cents, quantity, kind, created_at, status
        from orders where $1 = any(slot_ids) order by created_at desc limit 20`,
-      [req.params.slotId],
-    )
-    return { holding: rows[0], history }
-  })
+        [req.params.slotId],
+      )
+      return { holding: rows[0], history }
+    },
+  )
 
   app.get<{ Params: { id: string } }>("/api/v1/companies/:id", async (req, reply) => {
     const { rows } = await pool.query(`select company_id, name, url, tagline, logo_url, primary_color, ink_color from companies where company_id = $1`, [
