@@ -88,8 +88,15 @@ async function main() {
     ;(req as any).rawBody = body
     try {
       done(null, body.length ? JSON.parse(body.toString()) : {})
-    } catch (err) {
-      done(err as Error, undefined)
+    } catch {
+      // Tag the error as a 400. A bare SyntaxError from JSON.parse carries no statusCode, so the
+      // error handler's `?? 500` default turned every malformed request body into "Internal Server
+      // Error" — blaming the server for the client's bad JSON, and logging it at error level so
+      // real faults compete with junk traffic in the logs. The message is deliberately generic:
+      // echoing the parser's text back would quote fragments of the attacker's own payload.
+      const err = new Error("Malformed JSON body") as Error & { statusCode?: number }
+      err.statusCode = 400
+      done(err, undefined)
     }
   })
 
